@@ -1,9 +1,0 @@
-services:
-  postgres:
-    image: postgres:18
-    environment:
-      POSTGRES_DB: brewery
-      POSTGRES_USER: brewery
-      POSTGRES_PASSWORD: brewery
-    ports:
-      - "5432"

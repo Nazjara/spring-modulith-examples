@@ -16,8 +16,7 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 public class BreweryApplication {
 
     /**
-     * Starts the application. With {@code spring-boot-docker-compose} on the classpath, Boot starts the services
-     * in {@code compose.yaml} and connects to them before the context refreshes.
+     * Starts the application.
      *
      * @param args command-line arguments
      */

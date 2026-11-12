@@ -1,0 +1,42 @@
+@host = http://localhost:8080
+
+### Catalog: list beers (inserted by V1__catalog.sql)
+GET {{host}}/api/v1/beers
+
+### Catalog: find beer by UPC
+GET {{host}}/api/v1/beers/0631234200036
+
+### Catalog: unknown UPC -> 404
+GET {{host}}/api/v1/beers/unknown
+
+### Inventory: stock of one beer (inserted by V2__inventory.sql)
+GET {{host}}/api/v1/inventory/0631234200036
+
+### Order: place an order (UPCs validated by a direct call to CatalogService) -> 201, status NEW
+POST {{host}}/api/v1/orders
+Content-Type: application/json
+
+{
+  "customerRef": "tasting-room",
+  "lines": [
+    { "upc": "0631234200036", "quantity": 3 },
+    { "upc": "0083783375213", "quantity": 1 }
+  ]
+}
+
+> {% client.global.set("orderId", response.body.id); %}
+
+### Order: read the order placed above
+GET {{host}}/api/v1/orders/{{orderId}}
+
+### Order: unknown UPC -> 400 problem detail listing unknownUpcs, nothing stored
+POST {{host}}/api/v1/orders
+Content-Type: application/json
+
+{
+  "customerRef": "tasting-room",
+  "lines": [
+    { "upc": "0631234200036", "quantity": 1 },
+    { "upc": "9999999999999", "quantity": 1 }
+  ]
+}
