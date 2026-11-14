@@ -13,6 +13,7 @@ GET {{host}}/api/v1/beers/unknown
 GET {{host}}/api/v1/inventory/0631234200036
 
 ### Order: place an order (UPCs validated by a direct call to CatalogService) -> 201, status NEW
+# OrderPlaced is handled by inventory after this request's transaction commits.
 POST {{host}}/api/v1/orders
 Content-Type: application/json
 
@@ -26,8 +27,37 @@ Content-Type: application/json
 
 > {% client.global.set("orderId", response.body.id); %}
 
-### Order: read the order placed above
+### Order: read the order placed above -> ALLOCATED (allocation ran asynchronously)
 GET {{host}}/api/v1/orders/{{orderId}}
+
+### Inventory: stock reduced by the allocation
+GET {{host}}/api/v1/inventory/0631234200036
+
+### Order: cancel the allocated order -> 200, status CANCELLED; OrderCancelled releases the stock
+POST {{host}}/api/v1/orders/{{orderId}}/cancel
+
+### Inventory: stock restored by the deallocation
+GET {{host}}/api/v1/inventory/0631234200036
+
+### Order: cancel it again -> 409 problem detail
+POST {{host}}/api/v1/orders/{{orderId}}/cancel
+
+### Order: more than in stock -> 201 NEW, then ALLOCATION_FAILED with nothing reserved
+POST {{host}}/api/v1/orders
+Content-Type: application/json
+
+{
+  "customerRef": "tasting-room",
+  "lines": [
+    { "upc": "0083783375213", "quantity": 1 },
+    { "upc": "0631234200036", "quantity": 1000 }
+  ]
+}
+
+> {% client.global.set("failedOrderId", response.body.id); %}
+
+### Order: read the order placed above -> ALLOCATION_FAILED
+GET {{host}}/api/v1/orders/{{failedOrderId}}
 
 ### Order: unknown UPC -> 400 problem detail listing unknownUpcs, nothing stored
 POST {{host}}/api/v1/orders

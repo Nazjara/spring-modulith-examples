@@ -1,6 +1,7 @@
 package com.nazjara.brewery.order.web;
 
 import com.nazjara.brewery.order.OrderInfo;
+import com.nazjara.brewery.order.OrderNotCancellableException;
 import com.nazjara.brewery.order.OrderService;
 import com.nazjara.brewery.order.PlaceOrder;
 import com.nazjara.brewery.order.UnknownBeerException;
@@ -51,6 +52,28 @@ class OrderController {
     @GetMapping("/{id}")
     ResponseEntity<OrderInfo> findById(@PathVariable long id) {
         return ResponseEntity.of(orders.findById(id));
+    }
+
+    /**
+     * Cancels an order whose allocation has finished; reserved stock is released asynchronously.
+     *
+     * @param id order identifier
+     * @return 200 with the cancelled order, or 404 if none exists
+     */
+    @PostMapping("/{id}/cancel")
+    ResponseEntity<OrderInfo> cancel(@PathVariable long id) {
+        return ResponseEntity.of(orders.cancel(id));
+    }
+
+    /**
+     * Maps a cancellation in the wrong status to a 409 problem response.
+     *
+     * @param exception the rejected cancellation
+     * @return the problem detail
+     */
+    @ExceptionHandler
+    ProblemDetail handle(OrderNotCancellableException exception) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, exception.getMessage());
     }
 
     /**

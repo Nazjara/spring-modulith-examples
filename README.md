@@ -56,6 +56,31 @@ order      → catalog                   allowedDependencies = "catalog"
 
 Requests: `brewery.http`.
 
+### Phase 2 — Events between modules
+
+Order allocation is an asynchronous conversation between `order` and `inventory`:
+
+```
+order ──OrderPlaced────────────────────▶ inventory   reserve stock (all or nothing)
+order ◀──OrderAllocated / OrderAllocationFailed──── inventory
+order ──OrderCancelled─────────────────▶ inventory   release stock
+```
+
+```
+catalog    ← no dependencies           allowedDependencies = {}
+inventory  → order                     allowedDependencies = "order"
+order      → catalog                   allowedDependencies = "catalog"
+```
+
+- **Events can go both ways; type dependencies can't.** `verify()` finds cycles from type references (a listener's parameter, a call, a field), not from the direction events travel. `order` declares all four event types, including the replies. `inventory` listens to `order`'s events and publishes `order`'s reply types, so it depends on `order`; `order` listens only to its own types and does not depend on `inventory`. If `inventory` owned the reply type instead (say `StockAllocated`), `order`'s listener would reference it and `verify()` would report the cycle `order → inventory → order`. The microservices never showed this coupling because each service kept its own copy of `AllocateOrderRequest` / `AllocateOrderResult` and only JSON crossed the wire.
+- **`@ApplicationModuleListener`** = `@Async` + `@Transactional(REQUIRES_NEW)` + `@TransactionalEventListener` (after commit). The listener sees an event only if the publishing transaction commits, runs on a task-executor thread (`task-N` in the logs), and has its own transaction. `POST /orders` therefore returns `NEW`; the order becomes `ALLOCATED` or `ALLOCATION_FAILED` a moment later.
+- **Publish inside a transaction.** If no transaction is active when an event is published, Spring skips every `@ApplicationModuleListener` for it and logs that only at debug level. `ModularityTests` passes an extra ArchUnit rule to `verify()` (`VerificationOptions.andAdditionalVerifications`): every method that calls `ApplicationEventPublisher.publishEvent` must be `@Transactional`, on the method or its class, so a forgotten annotation fails the build. It cannot see self-invocation, where the annotation is present but bypassed.
+- **Async needs `@EnableAsync`** (`AsyncConfiguration`). The project uses only `spring-modulith-events-api`, which holds the annotation; `spring-modulith-events-core` would enable async on its own but fails to start without an Event Publication Registry (Phase 4).
+- **Failure behaviour (no registry yet):** an exception in a listener rolls back only that listener's transaction and is logged; nothing retries it. If the app stops between the order commit and the listener, the event is lost. The order stays `NEW`.
+- **Statuses:** `NEW → ALLOCATED | ALLOCATION_FAILED → CANCELLED`. Cancelling a `NEW` order is a 409: the async allocation could otherwise run after the cancellation and reserve stock for a cancelled order.
+- **Inventory side:** `Allocation` aggregate (`V4__inventory_allocation.sql`) records what was reserved per order, referencing the order by id with no foreign key. Stock rows are read with `SELECT … FOR UPDATE` (`@Lock(PESSIMISTIC_WRITE)`) in UPC order, so concurrent allocations of the same beer can't oversell. A repeated `OrderPlaced` for an already allocated order is ignored.
+- **Tests:** `BreweryIntegrationTests` waits for the asynchronous outcome with Awaitility.
+
 ## Microservices → Modulith
 
 | Microservices | Modulith | Phase |
@@ -65,3 +90,7 @@ Requests: `brewery.http`.
 | Service boundary = network + separate codebase | Module boundary = package, checked by `ApplicationModules.verify()` (test and startup) and `allowedDependencies` | 1 |
 | Order validation over JMS (`ValidateOrderRequest` → `ValidateOrderResult`, `VALIDATION_PENDING`) | Direct call `OrderService` → `CatalogService` before the order is stored | 1 |
 | `DataLoader` / `BeerInventoryBootstrap` `CommandLineRunner`s inserting data on every start | Flyway migrations per module, applied once | 1 |
+| Allocation over JMS (`ALLOCATE_ORDER_QUEUE` → `AllocateOrderListener`, reply on `ALLOCATE_ORDER_RESPONSE_QUEUE` → `AllocationResultListener`) | `OrderPlaced` → `@ApplicationModuleListener` in `inventory` → `OrderAllocated` / `OrderAllocationFailed` → listener in `order`; after commit, on executor threads | 2 |
+| Deallocation over JMS (`DEALLOCATE_ORDER_QUEUE` → `DeallocateOrderListener`) | `OrderCancelled` → `@ApplicationModuleListener` in `inventory` | 2 |
+| Event classes copied into each service, JSON on the wire | One set of event records owned by `order`; the owner decides the dependency direction | 2 |
+| Spring State Machine driving order status | Status transitions on the `BeerOrder` aggregate | 2 |
