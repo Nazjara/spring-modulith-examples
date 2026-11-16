@@ -81,6 +81,23 @@ order      → catalog                   allowedDependencies = "catalog"
 - **Inventory side:** `Allocation` aggregate (`V4__inventory_allocation.sql`) records what was reserved per order, referencing the order by id with no foreign key. Stock rows are read with `SELECT … FOR UPDATE` (`@Lock(PESSIMISTIC_WRITE)`) in UPC order, so concurrent allocations of the same beer can't oversell. A repeated `OrderPlaced` for an already allocated order is ignored.
 - **Tests:** `BreweryIntegrationTests` waits for the asynchronous outcome with Awaitility.
 
+### Phase 3 — Module integration tests
+
+`@ApplicationModuleTest` is a `@SpringBootTest` cut down to one module: component scanning, auto-configuration packages and Spring Data repositories are limited to the included modules (plus the root package), beans of other modules are removed from the context, and `ApplicationModules.verify()` runs first. Everything inside the module stays real: database, Flyway schema, transactions, after-commit async listener dispatch. A module test checks the module against its infrastructure; `BreweryIntegrationTests` (full app) checks the modules against each other.
+
+| Bootstrap mode | Loads |
+|---|---|
+| `STANDALONE` (default) | the module only |
+| `DIRECT_DEPENDENCIES` | plus the modules it depends on |
+| `ALL_DEPENDENCIES` | plus their dependencies, transitively |
+
+- **Only injected beans count as dependencies, event types don't.** `order` injects `CatalogService`, so `DIRECT_DEPENDENCIES` brings `catalog` in. `inventory` uses only `order`'s event types, so `order` is absent from `inventory`'s test in every mode. Modules connected by events can be tested completely alone; a synchronous call pulls the other module in or forces a mock.
+- **Mock another module only for a reason:** it is expensive or non-deterministic, its failures are hard to trigger, or another team owns it. `catalog` is none of these, so `OrderModuleTests` uses `DIRECT_DEPENDENCIES` and the real `catalog`. Removed beans are not replaced automatically: `order` in `STANDALONE` would not start without a `@MockitoBean CatalogService`.
+- **The test plays the absent module.** `InventoryModuleTests` publishes `OrderPlaced` and expects `OrderAllocated` / `OrderAllocationFailed`; `OrderModuleTests` checks that placing an order publishes `OrderPlaced`, then publishes the replies itself and waits for the status to change.
+- **`Scenario`** (test method parameter): `publish(event)` or `stimulate(...)`, then `andWaitForEventOfType(T.class).matching…(…).toArrive()` or `andWaitForStateChange(supplier, condition)`. `publish` runs in its own transaction, which `@ApplicationModuleListener`s need. Waiting is Awaitility on the app's task executor. An event expectation does nothing until `toArrive…` is called: without it the stimulus never runs and the test passes having tested nothing.
+- **`AssertablePublishedEvents`** records every event published in the context during a test method, at `publishEvent` time, before the publisher's transaction commits. A recorded event is therefore not proof of delivery, and a reply may be visible before the listener's changes are committed: `InventoryModuleTests` waits for the stock change first, then expects the event. Leftover async work from an earlier test can publish into the current test's recording, so tests match on the order id.
+- **Cost:** each module/mode combination is its own cached Spring context, and with `TestcontainersConfiguration` its own PostgreSQL container. Flyway runs all migrations in each.
+
 ## Microservices → Modulith
 
 | Microservices | Modulith | Phase |
@@ -94,3 +111,4 @@ order      → catalog                   allowedDependencies = "catalog"
 | Deallocation over JMS (`DEALLOCATE_ORDER_QUEUE` → `DeallocateOrderListener`) | `OrderCancelled` → `@ApplicationModuleListener` in `inventory` | 2 |
 | Event classes copied into each service, JSON on the wire | One set of event records owned by `order`; the owner decides the dependency direction | 2 |
 | Spring State Machine driving order status | Status transitions on the `BeerOrder` aggregate | 2 |
+| Per-service test suite with stubbed neighbours (mocked Feign client, JMS test harness on the queues) | `@ApplicationModuleTest` per module (bootstrap mode decides which modules load) + `Scenario` / `AssertablePublishedEvents` | 3 |
