@@ -75,8 +75,8 @@ order      → catalog                   allowedDependencies = "catalog"
 - **Events can go both ways; type dependencies can't.** `verify()` finds cycles from type references (a listener's parameter, a call, a field), not from the direction events travel. `order` declares all four event types, including the replies. `inventory` listens to `order`'s events and publishes `order`'s reply types, so it depends on `order`; `order` listens only to its own types and does not depend on `inventory`. If `inventory` owned the reply type instead (say `StockAllocated`), `order`'s listener would reference it and `verify()` would report the cycle `order → inventory → order`. The microservices never showed this coupling because each service kept its own copy of `AllocateOrderRequest` / `AllocateOrderResult` and only JSON crossed the wire.
 - **`@ApplicationModuleListener`** = `@Async` + `@Transactional(REQUIRES_NEW)` + `@TransactionalEventListener` (after commit). The listener sees an event only if the publishing transaction commits, runs on a task-executor thread (`task-N` in the logs), and has its own transaction. `POST /orders` therefore returns `NEW`; the order becomes `ALLOCATED` or `ALLOCATION_FAILED` a moment later.
 - **Publish inside a transaction.** If no transaction is active when an event is published, Spring skips every `@ApplicationModuleListener` for it and logs that only at debug level. `ModularityTests` passes an extra ArchUnit rule to `verify()` (`VerificationOptions.andAdditionalVerifications`): every method that calls `ApplicationEventPublisher.publishEvent` must be `@Transactional`, on the method or its class, so a forgotten annotation fails the build. It cannot see self-invocation, where the annotation is present but bypassed.
-- **Async needs `@EnableAsync`** (`AsyncConfiguration`). The project uses only `spring-modulith-events-api`, which holds the annotation; `spring-modulith-events-core` would enable async on its own but fails to start without an Event Publication Registry (Phase 4).
-- **Failure behaviour (no registry yet):** an exception in a listener rolls back only that listener's transaction and is logged; nothing retries it. If the app stops between the order commit and the listener, the event is lost. The order stays `NEW`.
+- **Async needs `@EnableAsync`.** Since Phase 4, `spring-modulith-events-core` (part of the registry starter) enables it unless the app declares its own; without a registry it can't be used, so Phase 2 declared `@EnableAsync` itself.
+- **Failure behaviour (no registry until Phase 4):** an exception in a listener rolls back only that listener's transaction and is logged; nothing retries it. If the app stops between the order commit and the listener, the event is lost. The order stays `NEW`.
 - **Statuses:** `NEW → ALLOCATED | ALLOCATION_FAILED → CANCELLED`. Cancelling a `NEW` order is a 409: the async allocation could otherwise run after the cancellation and reserve stock for a cancelled order.
 - **Inventory side:** `Allocation` aggregate (`V4__inventory_allocation.sql`) records what was reserved per order, referencing the order by id with no foreign key. Stock rows are read with `SELECT … FOR UPDATE` (`@Lock(PESSIMISTIC_WRITE)`) in UPC order, so concurrent allocations of the same beer can't oversell. A repeated `OrderPlaced` for an already allocated order is ignored.
 - **Tests:** `BreweryIntegrationTests` waits for the asynchronous outcome with Awaitility.
@@ -98,6 +98,42 @@ order      → catalog                   allowedDependencies = "catalog"
 - **`AssertablePublishedEvents`** records every event published in the context during a test method, at `publishEvent` time, before the publisher's transaction commits. A recorded event is therefore not proof of delivery, and a reply may be visible before the listener's changes are committed: `InventoryModuleTests` waits for the stock change first, then expects the event. Leftover async work from an earlier test can publish into the current test's recording, so tests match on the order id.
 - **Cost:** each module/mode combination is its own cached Spring context, and with `TestcontainersConfiguration` its own PostgreSQL container. Flyway runs all migrations in each.
 
+### Phase 4 — Event Publication Registry
+
+`spring-modulith-starter-jdbc` makes events durable. Every `publishEvent` writes one row per after-commit listener into `event_publication`, **in the publishing transaction**: the order and the record that `inventory` still has to handle it commit or roll back together (a transactional outbox). After commit, the listener runs as before, and the registry records the outcome:
+
+```
+place() tx:   INSERT beer_order + INSERT event_publication (PUBLISHED)      ── commit
+task-N:       mark PROCESSING (own tx) → listener (own tx) → mark COMPLETED (own tx)
+                                                         └ exception → mark FAILED (own tx)
+```
+
+| Status | Meaning |
+|---|---|
+| `PUBLISHED` | Stored with the business data, listener not started |
+| `PROCESSING` | Listener running |
+| `COMPLETED` | Listener's transaction committed |
+| `FAILED` | Listener threw, or the row was stuck too long (staleness) |
+| `RESUBMITTED` | Claimed for another attempt (`completion_attempts` + 1) |
+
+- **Schema through Flyway.** `V5__event_publication.sql` holds Modulith's v2 PostgreSQL schema; `spring.modulith.events.jdbc.schema-initialization.enabled=false`. Without that property the starter creates the table itself at startup, although its metadata documents `false` as the default. The table belongs to no module. **Upgrade obligation:** the table is now ours to evolve. On every Spring Modulith upgrade, diff `schemas/v2/schema-postgresql.sql` in the new `spring-modulith-events-jdbc` jar against V5 and add a migration for any change. The starter's own initializer would not do it either: it only runs `CREATE TABLE IF NOT EXISTS` and never alters an existing table (Modulith's v1 → v2 change needed a manual migration). `EventPublicationRows` queries the same columns.
+- **At-least-once delivery.** `COMPLETED` is written in its own transaction after the listener's commits, so a crash in between re-runs the listener later. Every listener is idempotent: `inventory` ignores `OrderPlaced` for an order that already has an allocation, and `order` ignores a reply for an order that is no longer `NEW`. The check alone only covers duplicates that arrive one after another. Concurrent ones are possible too (a slow listener outliving its staleness threshold is resubmitted while still running): `inventory` is protected by the `UNIQUE` `allocation.order_id`, so the second insert fails and its stock change rolls back; `order` reads the order with `SELECT … FOR UPDATE` (`BeerOrderRepository.findLockedById`), so the duplicate waits, then sees the new status. Without the lock both would read `NEW`, and the later save could overwrite a cancellation committed in between.
+- **Nothing retries on its own.** The registry stores and tracks; retrying is the app's job. `EventPublicationMaintenance` (root package) schedules `FailedEventPublications.resubmit(ResubmissionOptions)` every 30 s for `FAILED` rows at least 30 s old, at most 20 waiting to start per instance (`brewery.events.resubmission.*`). Each row is claimed with a conditional update before the listener runs again, so with several instances exactly one re-runs it. The job is not transactional: an enclosing transaction would hold the claimed rows locked while the listener tries to mark them `PROCESSING`.
+- **Staleness monitor** (`spring.modulith.events.staleness.*`, 1 min): a row stuck in `PUBLISHED`, `PROCESSING` or `RESUBMITTED` (the instance died mid-listener) is marked `FAILED`, so the resubmission picks it up. Thresholds must exceed the slowest listener plus executor queueing, otherwise a slow but alive listener is re-run in parallel. It needs `@EnableScheduling`; `spring-modulith-moments` (in `starter-core`, active by default) already enables it, `EventPublicationMaintenance` declares it again so nothing depends on Moments.
+- **No republish on restart.** `spring.modulith.events.republish-outstanding-events-on-restart` resubmits every incomplete row at startup, including rows other instances are processing right now, so each restart or rolling deploy duplicates in-flight work. Staleness plus scheduled resubmission recovers the same events by age instead.
+- **Completion mode `update`:** completed rows stay for inspection; `EventPublicationMaintenance` deletes those completed more than 7 days ago, hourly (`brewery.events.purge.*`). `delete` would keep no history, `archive` moves rows to `event_publication_archive`.
+- **Events are a persisted contract.** Rows hold the event as JSON plus its class name. Renaming or moving an event record, or changing its fields, breaks the retry of rows written before the change.
+- **Known gap: poison events.** Modulith 2.1.2 has no retry limit, no "given up" status and no dead-letter queue. An event whose listener can never succeed stays `FAILED` and is resubmitted on every run, forever. Resubmission reads the oldest `FAILED` rows first, limited by `max-in-flight`, so once there are that many poison events, every run is spent on them and newer failures are never retried. `ResubmissionOptions.withFilter` can't exclude them: it is applied in memory after that limited query. Until custom handling exists (e.g. moving rows past an attempt cap to a dead-letter table), watch the number of `FAILED` rows and their `completion_attempts`.
+- **Tests:** `OrderModuleTests` runs the real schedule shortened to 0.2 s: a repository spy throws once, the reply's row goes `FAILED`, is resubmitted and ends `COMPLETED` with 2 attempts; a repeated reply completes without changing the order. `InventoryModuleTests` publishes `OrderPlaced` twice and, once both rows are `COMPLETED`, checks that stock was taken once. `EventPublicationRows` reads the table, because the registry API lists completed publications only.
+
+See the lifecycle while the app runs:
+
+```sql
+SELECT event_type, listener_id, status, completion_attempts, publication_date, completion_date
+FROM event_publication
+ORDER BY publication_date DESC;
+```
+
 ## Microservices → Modulith
 
 | Microservices | Modulith | Phase |
@@ -112,3 +148,6 @@ order      → catalog                   allowedDependencies = "catalog"
 | Event classes copied into each service, JSON on the wire | One set of event records owned by `order`; the owner decides the dependency direction | 2 |
 | Spring State Machine driving order status | Status transitions on the `BeerOrder` aggregate | 2 |
 | Per-service test suite with stubbed neighbours (mocked Feign client, JMS test harness on the queues) | `@ApplicationModuleTest` per module (bootstrap mode decides which modules load) + `Scenario` / `AssertablePublishedEvents` | 3 |
+| Message held by the JMS broker between send and receive; DB commit and send are two separate writes | Event Publication Registry: one `event_publication` row per event and listener, written in the publishing transaction | 4 |
+| Broker redelivery of unacknowledged messages | Staleness monitor + scheduled `FailedEventPublications.resubmit` (`EventPublicationMaintenance`) | 4 |
+| Dead-letter queue after a maximum number of delivery attempts | None in Modulith 2.1.2 (known gap, see Phase 4) | 4 |

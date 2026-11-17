@@ -2,6 +2,8 @@ package com.nazjara.brewery.inventory;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.nazjara.brewery.EventPublicationRows;
+import com.nazjara.brewery.EventPublicationRows.Row;
 import com.nazjara.brewery.TestcontainersConfiguration;
 import com.nazjara.brewery.order.LineItem;
 import com.nazjara.brewery.order.OrderAllocated;
@@ -13,6 +15,7 @@ import java.util.List;
 import lombok.RequiredArgsConstructor;
 import org.junit.jupiter.api.Test;
 import org.springframework.context.annotation.Import;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.modulith.test.ApplicationModuleTest;
 import org.springframework.modulith.test.Scenario;
 
@@ -29,6 +32,10 @@ import org.springframework.modulith.test.Scenario;
  * {@code publishEvent} time, before that transaction commits. A test that reads the stock right after the reply
  * arrives can therefore see the old value; waiting for the stock change first and then expecting the event avoids
  * that race.
+ * <p>
+ * A repeated {@code OrderPlaced} changes nothing and publishes nothing, so the only sign that the listener has handled
+ * it is its row in the Event Publication Registry turning {@code COMPLETED}; the test waits for that before checking
+ * the stock.
  */
 @ApplicationModuleTest
 @Import(TestcontainersConfiguration.class)
@@ -40,6 +47,7 @@ class InventoryModuleTests {
     private static final String NO_HAMMERS_UPC = "0631234200037";
 
     private final InventoryService inventory;
+    private final JdbcTemplate jdbc;
 
     @Test
     void allocatesOrderWithEnoughStockAndRepliesAllocated(Scenario scenario) {
@@ -63,6 +71,21 @@ class InventoryModuleTests {
                 .toArrive();
 
         assertThat(stockOf(CACTUS_GOSE_UPC)).isEqualTo(goseBefore);
+    }
+
+    @Test
+    void repeatedOrderPlacedTakesStockOnce(Scenario scenario) {
+        var stockBefore = stockOf(BLESSED_UPC);
+        var event = new OrderPlaced(9003L, List.of(new LineItem(BLESSED_UPC, 2)));
+        scenario.publish(event)
+                .andWaitForStateChange(() -> EventPublicationRows.of(jdbc, OrderPlaced.class, 9003L),
+                        rows -> rows.equals(List.of(Row.COMPLETED_FIRST_TIME)));
+
+        scenario.publish(event)
+                .andWaitForStateChange(() -> EventPublicationRows.of(jdbc, OrderPlaced.class, 9003L),
+                        rows -> rows.equals(List.of(Row.COMPLETED_FIRST_TIME, Row.COMPLETED_FIRST_TIME)));
+
+        assertThat(stockOf(BLESSED_UPC)).isEqualTo(stockBefore - 2);
     }
 
     private int stockOf(String upc) {

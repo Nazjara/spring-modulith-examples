@@ -26,8 +26,10 @@ import org.springframework.stereotype.Component;
  * {@code @ApplicationModuleListener} combines {@code @Async}, {@code @Transactional(REQUIRES_NEW)} and
  * {@code @TransactionalEventListener} (after commit). Each event is handled on a task-executor thread, in a new
  * transaction, only after the order transaction has committed, so the HTTP request that placed the order has usually
- * returned already. A failure here rolls back only this transaction: the order stays {@code NEW}, and without the
- * Event Publication Registry the event is neither stored nor retried.
+ * returned already. A failure here rolls back only this transaction: the order stays {@code NEW}, the Event
+ * Publication Registry marks the event's publication {@code FAILED}, and {@code EventPublicationMaintenance}
+ * resubmits it later. Because delivery is at-least-once, a repeated {@link OrderPlaced} for an order that already has
+ * an allocation is ignored.
  * <p>
  * The reply ({@link OrderAllocated} or {@link OrderAllocationFailed}) is published inside this listener's transaction,
  * so the order module sees it only if the reservation commits. Allocation is all-or-nothing: either every line is

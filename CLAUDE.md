@@ -20,6 +20,7 @@ Java 25, Spring Boot 4.1.2, Spring Modulith 2.1.2 (BOM), Spring Data JDBC, Flywa
 - Cross-module references go through the API or events, never internal types. `ModularityTests` (`ApplicationModules.verify()`) must stay green.
 - Aggregates reference other modules' aggregates by id only.
 - Schema changes go through Flyway migrations in `src/main/resources/db/migration`.
+- On a Spring Modulith version bump, diff `org/springframework/modulith/events/jdbc/schemas/v2/schema-postgresql.sql` in the new `spring-modulith-events-jdbc` sources against `V5__event_publication.sql`; any difference needs a new migration (the registry table is ours to evolve).
 - Records for DTOs and events. Lombok only for `@Slf4j` / `@RequiredArgsConstructor`.
 - Javadoc on every class and public method in API, service, config and bootstrap code: explain what Modulith does under the hood and name the microservices mechanism it replaces.
 - Keep the domain thin; each phase shows a Modulith feature, not business logic. Design the idiomatic Modulith way; do not mirror the old microservices' shape.
