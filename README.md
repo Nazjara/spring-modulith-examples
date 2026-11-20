@@ -134,6 +134,45 @@ FROM event_publication
 ORDER BY publication_date DESC;
 ```
 
+### Phase 7 — Documentation
+
+`DocumentationTests` draws the module model that `ModularityTests` verifies, so the documentation is regenerated on every build and always matches the code. It is a plain unit test with no Spring context. `Documenter` comes with `spring-modulith-starter-test`. Output goes to `target/spring-modulith-docs` and is not committed:
+
+| File | Content |
+|---|---|
+| `components.puml` | All modules and their dependencies (C4 component diagram): `Order` uses `Catalog`, `Inventory` listens to `Order` |
+| `module-<name>.puml` | One module and its direct neighbours |
+| `module-<name>.adoc` | Module canvas: description, base package, API services, bean references to other modules, events listened to |
+| `all-docs.adoc` | One page including all diagrams and canvases |
+
+- **Javadoc in the canvases.** The `spring-modulith-apt` annotation processor (next to Lombok in `maven-compiler-plugin`) extracts the Javadoc of main classes and `package-info.java` into `target/generated-spring-modulith/javadoc.json` at compile time. `Documenter` reads it for the module descriptions and the component and bean-reference entries.
+- **Not Modulith-specific.** `ApplicationModules.of(...)` accepts any `@SpringBootApplication` class and treats its direct sub-packages as modules. An app without `package-info`/`@ApplicationModule` can still be documented, and the diagrams then show the dependencies it actually has.
+- **Viewing.** The diagrams are PlantUML (GitHub renders only Mermaid, so nothing is committed): open the `.puml` files with IntelliJ's PlantUML Integration plugin, or `all-docs.adoc` with the AsciiDoc plugin.
+- **Side effect.** `Documenter` also writes `target/classes/META-INF/spring-modulith/application-modules.json`, so a jar packaged after the tests contains the module model and the runtime reads it instead of scanning the packages at startup.
+- **Only C4 level 3.** Internally `Documenter` builds a C4 model with one system, one container and one component per module, all without descriptions. It knows nothing about users or the database, and its model can't be extended. The full C4 description is hand-written (Phase 7b).
+
+### Phase 7b — C4 model
+
+`docs/architecture/workspace.dsl` describes the brewery with the [C4 model](https://c4model.com) in Structurizr DSL: the model (people, the system, its containers and components) is written once, and each diagram is a view of it.
+
+| View | C4 level | Shows |
+|---|---|---|
+| `Context` | 1 | The API client and the Brewery system; no other systems |
+| `Containers` | 2 | The application and PostgreSQL: a modular monolith is one container plus its database |
+| `Components` | 3 | `catalog`, `inventory`, `order`, the Event Publication Registry and `EventPublicationMaintenance` inside the application |
+| `PlaceOrder` | dynamic | Placing an order step by step: the call to `catalog`, then events through the registry |
+
+- **Level 4 (code) is left out**, as C4 recommends: it changes with every commit, and the IDE draws class diagrams on demand.
+- **Hand-written, so it can drift.** Levels 1–2 change rarely. Level 3 duplicates what `ModularityTests` checks and `Documenter` generates; when modules change, update `workspace.dsl` too.
+- **View locally** (Docker; Structurizr Lite and the hosted service are retired, `local` replaces Lite):
+
+  ```bash
+  docker run -it --rm -p 8090:8080 -u "$(id -u):$(id -g)" -v "$PWD/docs/architecture:/usr/local/structurizr" structurizr/structurizr local
+  ```
+
+  Then open http://localhost:8090. Edits to `workspace.dsl` show after a page reload. The generated `workspace.json` and `.structurizr/` are ignored (all views use automatic layout).
+- **Validate:** replace `local` with `validate -w /usr/local/structurizr/workspace.dsl`.
+
 ## Microservices → Modulith
 
 | Microservices | Modulith | Phase |
@@ -151,3 +190,4 @@ ORDER BY publication_date DESC;
 | Message held by the JMS broker between send and receive; DB commit and send are two separate writes | Event Publication Registry: one `event_publication` row per event and listener, written in the publishing transaction | 4 |
 | Broker redelivery of unacknowledged messages | Staleness monitor + scheduled `FailedEventPublications.resubmit` (`EventPublicationMaintenance`) | 4 |
 | Dead-letter queue after a maximum number of delivery attempts | None in Modulith 2.1.2 (known gap, see Phase 4) | 4 |
+| Architecture diagrams drawn by hand, or Zipkin's dependency view built from runtime traffic | `Documenter`: diagrams and module canvases generated from the bytecode on every build | 7 |

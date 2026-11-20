@@ -8,3 +8,7 @@ target/
 
 PLAN.md
 PLAN.md.bak
+
+# Structurizr local: search index, logs, generated JSON (layout is automatic)
+docs/architecture/.structurizr/
+docs/architecture/workspace.json
